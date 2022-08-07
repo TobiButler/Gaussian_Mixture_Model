@@ -280,16 +280,38 @@ class Guassian_Mixture_Model():
                     v = t.maximum(v, t.tensor(1, device=self.device, dtype=self.dtype))
                     new_cov = t.matmul(s*v,d) * minimum_directional_covariance
                     
-                    if t.slogdet(new_cov)[1] < minimum_total_log_covariance:
+                    if t.slogdet(new_cov)[1] < minimum_total_log_covariance: # average covariance matrix is too small, need to adjust it
                         converged_clusters[0] = True
-                        if t.isinf(t.slogdet(new_cov)[1]): 
+                        # check if log-covariance matrix has underflowed yet
+                        if t.isinf(t.slogdet(new_cov)[1]):  # if it hasn't underflowed, can scale it to minimum allowed size
                             new_cov = self.bandwidths
-                        else:
+                        else: # if it has underflowed, must replace it with the previous estimate
                             new_cov = new_cov * t.exp((minimum_total_log_covariance-t.slogdet(new_cov)[1])/new_cov.shape[1])
                     self.bandwidths = new_cov
-                else: pass # HERE NEED TO ADD THE NOT CONSISTANT_VARIANCE PART BACK IN. SHOULD BE EASY JUST DON"T AVERAGE
+                else:
+                    for n in range(len(self.cluster_centers)):
+                        temp_samples = self.cluster_centers - self.cluster_centers[n] # data centered around n-th sample
+                        temp_cov = t.matmul(temp_samples.T, temp_samples*responsibilities[:,n][:,None])
+                        if self.covariance_matrix_type == "diagonal": 
+                            temp_cov = t.diag(temp_cov)
+                        elif self.covariance_matrix_type == "scalar": 
+                            temp_cov = t.mean(t.diag(temp_cov))
                     
-                # END MAXIMIZATION STEP
+                        # check that this cluster's covariance matrix is not too small. Adjust it if it is.
+                        temp_cov = temp_cov / minimum_directional_covariance
+                        s,v,d = t.linalg.svd(temp_cov)
+                        v = t.maximum(v, t.tensor(1, device=self.device, dtype=self.dtype))
+                        temp_cov = t.matmul(s*v,d) * minimum_directional_covariance
+                    
+                    if t.slogdet(temp_cov)[1] < minimum_total_log_covariance: # this cluster's covariance matrix is too small, need to adjust it
+                        converged_clusters[0] = True
+                        # check if log-covariance matrix has underflowed yet
+                        if t.isinf(t.slogdet(temp_cov)[1]): # if it hasn't underflowed, can scale it to minimum allowed size
+                            temp_cov = self.bandwidths[n] 
+                        else: # if it has underflowed, must replace it with the previous estimate
+                            temp_cov = temp_cov * t.exp((minimum_total_log_covariance-t.slogdet(temp_cov)[1])/temp_cov.shape[1])
+                    self.bandwidths[n] = temp_cov
+                # end maximization step
                 
                 if print_status and self.consistent_variance:
                         print("New covariance matrix log-determinant: " + str(t.slogdet(self.bandwidths)[1]))
