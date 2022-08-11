@@ -129,7 +129,7 @@ class Guassian_Mixture_Model():
         The model is fit using a version of the EM algorithm.
     '''
     def fit(self, samples:t.Tensor, class_labels:t.Tensor[int] = None, prior_cluster_probabilities:t.Tensor = None, initial_covariance_matrix:t.Tensor = None, 
-        cluster_concentration:float = 1, cluster_probability_shift:float = 0, minimum_total_log_covariance:float = -np.inf, minimum_directional_covariance:float = -np.inf, 
+        cluster_concentration:float = 1, minimum_total_log_covariance:float = -np.inf, minimum_directional_covariance:float = -np.inf, 
         responsibility_concentration:float = 1, convergence_flexibility:int = 1, convergence_change:float = 1, print_status = False, 
         attempt_gpu = True):
         """
@@ -151,10 +151,6 @@ class Guassian_Mixture_Model():
         cluster_concentration (float): Part of the dirichlet process prior. During each iteration of the EM algorithm, cluster probabilities 
             are raised to this value before being normalized again. This brings cluster probabilities closer together or pushes them further 
             apart depending on the value used.
-        
-        cluster_probability_shift (float): Part of the dirichlet process prior. During each iteration of the EM algorithm, cluster probabilities 
-            are raised to the power of themselves raised to this value, then they are normalized so that they sum to one. This also pushes cluster 
-            probabilities closer together or further apart depending on its value, and can adjust which cluster probs become the largest/smallest.
 
         minimum_total_log_covariance (float): The minimum value to which the log-determinant of any cluster covariance matrix is allowed to reach.
 
@@ -253,7 +249,7 @@ class Guassian_Mixture_Model():
             while not t.all(converged_clusters):
                 # compute cluster probabilities and apply dirichlet distribution prior:
                 self.cluster_probabilities = (t.sum(responsibilities, dim=1) / len(self.cluster_centers))[:,None] # K x len(cluster_concentrations)
-                self.cluster_probabilities = self.cluster_probabilities**(self.cluster_probabilities**cluster_probability_shift * cluster_concentration) # K x len(cluster_concentrations)
+                self.cluster_probabilities = self.cluster_probabilities**(cluster_concentration) # K x len(cluster_concentrations)
                 self.cluster_probabilities = self.cluster_probabilities/t.sum(self.cluster_probabilities, dim=0) #* self.cluster_concentrations[:,0][None,None,:]/t.sum(self.cluster_concentrations[:,0]), dim=2)
                 
                 if print_status:
