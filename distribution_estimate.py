@@ -15,6 +15,7 @@ import sys
 import math
 from copy import deepcopy
 from ctypes import ArgumentError
+import traceback
 
 # import modules from third party libraries:
 import torch as t
@@ -83,7 +84,7 @@ class Guassian_Mixture_Model():
         if str(samples.device) != self.device or samples.dtype != self.dtype: samples = samples.to(device=self.device, dtype=self.dtype)
         # compute likelihoods
         if self.covariance_matrix_type == 'full':
-            if self.constant_variance: 
+            if self.consistent_variance: 
                 log_probs_front = (-1/2)*t.slogdet(self.bandwidths)[1] # scalar
                 log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(self.cluster_centers-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths)) * self.cluster_centers-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # K x K
             else: 
@@ -91,7 +92,7 @@ class Guassian_Mixture_Model():
                 diffs = t.ones(size=(len(self.cluster_centers), self.cluster_centers.shape[1], len(self.cluster_centers))) * self.cluster_centers[:,:,None] - t.permute(self.cluster_centers[:,:,None], (2,1,0)) # num_clusters x num_features x num_clusters
                 log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ki', t.matmul(t.permute(diffs, (2,0,1)), t.permute(t.linalg.inv(self.bandwidths), (2,0,1))), t.permute(diffs, (2,0,1))) # K x N
         elif self.covariance_matrix_type == 'diagonal': 
-            if self.constant_variance: 
+            if self.consistent_variance: 
                 log_probs_front = (-1/2) * t.sum(t.log(self.bandwidths)) # scalar
                 log_probs = log_probs_front + t.stack(([(-1/2) + t.einsum('ij, ij -> i', ((self.cluster_centers-self.cluster_centers[n,:]) / self.bandwidths, self.cluster_centers-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
             else: 
@@ -99,7 +100,7 @@ class Guassian_Mixture_Model():
                 diffs = t.ones(size=(len(self.cluster_centers), self.cluster_centers.shape[1], len(self.cluster_centers))) * self.cluster_centers[:,:,None] - t.permute(self.cluster_centers[:,:,None], (2,1,0)) # num_clusters x num_features x num_bandwidths
                 log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ki', (diffs / self.bandwidths[None,:,:], diffs)) # K x N
         else: # self.covariance_matrix_type == 'scalar'
-            if self.constant_variance: 
+            if self.consistent_variance: 
                 log_probs_front = (-self.cluster_centers.shape[1]/2) * t.log(self.bandwidths) # scalar
                 log_probs = log_probs_front * t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((self.cluster_centers-self.cluster_centers[n,:]) / self.bandwidths, self.cluster_centers-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
             else: 
@@ -128,8 +129,8 @@ class Guassian_Mixture_Model():
         This method's arguments allow the user to put various prior distributions over the dataset in order to maximize cross validation. 
         The model is fit using a version of the EM algorithm.
     '''
-    def fit(self, samples:t.Tensor, class_labels:t.Tensor[int] = None, prior_cluster_probabilities:t.Tensor = None, initial_covariance_matrix:t.Tensor = None, 
-        cluster_concentration:float = 1, minimum_total_log_covariance:float = -np.inf, minimum_directional_covariance:float = -np.inf, 
+    def fit(self, samples:t.Tensor, class_labels:t.Tensor = None, prior_cluster_probabilities:t.Tensor = None, initial_covariance_matrix:t.Tensor = None, 
+        cluster_concentration:float = 1, minimum_total_log_covariance:float = -np.inf, minimum_directional_covariance:float = 1e-12, 
         responsibility_concentration:float = 1, convergence_flexibility:int = 1, convergence_change:float = 1, print_status = False, 
         attempt_gpu = True):
         """
@@ -142,7 +143,7 @@ class Guassian_Mixture_Model():
 
         prior_cluster_probabilities (t.Tensor): A prior for the mixture model's cluster probabilities. A good reason to provide this argument 
             is if you are fitting a second+ mixture model to your dataset of samples, using the reciprocal of your previous probability 
-            measurements as this prior.
+            measurements as this prior. Can be shape (num_cluster_probs), (1,num_cluster_probs), or (num_cluster_probs,1).
 
         initial_covariance_matrix (t.Tensor): The initial covariance matrix used for the distribution at each cluster center during the em 
             algorithm. If None is provided, then the initial covariance matrix is taken to be twice the M.L.E. covariance matrix for a 
@@ -193,13 +194,16 @@ class Guassian_Mixture_Model():
             if self.num_classes != 1 and (self.class_labels.dtype != self.dtype or str(self.class_labels.device) != self.device): self.class_labels = self.class_labels.to(device = self.device, dtype = self.dtype)
             
             # instantiate cluster center probs and variances
-            if prior_cluster_probabilities is None: self.cluster_probabilities = t.ones(size = (samples.shape[0],1), device=self.device, dtype=self.dtype) / samples.shape[0] # N x 1
-            else: 
-                if prior_cluster_probabilities.dim() == 1: self.cluster_probabilities = prior_cluster_probabilities[:,None]
+            
+            if prior_cluster_probabilities is not None:
+                if prior_cluster_probabilities.dim() == 1: prior_cluster_probabilities = prior_cluster_probabilities[:,None]
                 elif prior_cluster_probabilities.dim() == 2: 
                     if prior_cluster_probabilities.shape[1] != 1: raise ArgumentError(f"The argument \"prior_cluster_probabilities\" provided to the fit() method must have shape (num_samples,) or (num_samples, 1). fit() was given an argument with shape ({prior_cluster_probabilities.shape})")
-                    self.cluster_probabilities = prior_cluster_probabilities
                 else: raise ArgumentError(f"The argument \"prior_cluster_probabilities\" provided to the fit() method must have shape (num_samples,) or (num_samples, 1). fit() was given an argument with shape ({prior_cluster_probabilities.shape})")
+                self.cluster_probabilities = prior_cluster_probabilities
+            else: 
+                self.cluster_probabilities = t.ones(size = (samples.shape[0],1), device=self.device, dtype=self.dtype) / samples.shape[0] # N x 1
+                prior_cluster_probabilities = 1
             
             # instantiate initial covariance matrix
             if initial_covariance_matrix is not None: 
@@ -216,16 +220,16 @@ class Guassian_Mixture_Model():
             
             # adjust how covariance matrices are stored depending on the arguments passed
             if self.covariance_matrix_type == 'full': # most detailed option, keeps track of covariances in addition to feature variances
-                if self.constant_variance: self.bandwidths = bandwidth # keep track of a single full covariance matrix with shape (num_features, num_features)
+                if self.consistent_variance: self.bandwidths = bandwidth # keep track of a single full covariance matrix with shape (num_features, num_features)
                 else: # keep track of a full covariance matrix for every cluster center. This requires num_samples x num_features x num_features memory (too much for most datasets working on most machines)
                     self.bandwidths = t.ones(size=(bandwidth.shape[0], bandwidth.shape[0], len(self.cluster_centers)), device=self.device, dtype=self.dtype) * bandwidth[:,:,None] # gives tensor of shape (num_features, num_features * num_clusters)
             elif self.covariance_matrix_type == 'diagonal': # keeps track of just the variances of each feature, so features are assumed to be independent
                 bandwidth = t.diag(bandwidth) # gets just the feature variances
-                if self.constant_variance: self.bandwidths = bandwidth # has shape (num_features)
+                if self.consistent_variance: self.bandwidths = bandwidth # has shape (num_features)
                 else: self.bandwidths = t.ones(size=(len(self.cluster_centers), bandwidth.shape[0]), device=self.device, dtype=self.dtype) * bandwidth[None,:]  # gives tensor of shape (num_samples, n_features)
             else: # self.covariance_matrix_type == 'scalar': # This requires num_samples memory space
                 bandwidth = t.mean(t.diag(bandwidth)) # average the diagonal covariance values to produce a single scalar.
-                if self.constant_variance: self.bandwidths = bandwidth
+                if self.consistent_variance: self.bandwidths = bandwidth
                 else: self.bandwidths = bandwidth * t.ones(size=(len(self.cluster_centers), 1), device=self.device, dtype=self.dtype) # gives tensor of dim (num_components x 1). Each row of sigma_inv corresponds to a single inverse covariance scalar for the i-th cluster
             
             if print_status: 
@@ -234,22 +238,18 @@ class Guassian_Mixture_Model():
                 print("initial log-det: " + str(t.slogdet(self.bandwidths)[1]))
             
             # initial expectation step to set responsibilities and complete log likelihood
-            responsibilities, L_comp_old = self._expectation(prior_cluster_probabilities, print_status) # K x N
+            responsibilities, L_comp_old = self._expectation(print_status) # K x N
             if print_status: print("First comp-log likelihood: " + str(L_comp_old))
-            
-            # check if any samples have a responsibility greater than 0.99. If so, that sample's likelihood is going to diverge too quickly, so we should increase "responsibility_concentration"
-            if t.max(responsibilities) >= 0.99: raise ArgumentError("Sample responsibilities were ill-conditioned. Increase the \"responsibility_concentration\" argument and try again. We reccomend monitoring how quickly the responsibility values converge.")
-            
-            ###if (t.sum(t.abs(responsibilities - t.ones(size=(responsibilities.shape[0], 1), device=self.device, dtype=self.dtype) / responsibilities.shape[0]), dim=0)==0).any(): NOT USING THIS ANYMORE
             
             convergence_count = 0 # keeps track of how many times the em algorithm has converged
             count = 0 # keeps track of how many iterations the em algorithm has run for
-            if self.constant_variance: converged_clusters = t.zeros(1).bool() # keeps track of how many cluster_centers have converged/had their covariance matrix reach a minimum determinant
+            if self.consistent_variance: converged_clusters = t.zeros(1).bool() # keeps track of how many cluster_centers have converged/had their covariance matrix reach a minimum determinant
             else: converged_clusters = t.zeros(self.cluster_centers.shape[0]).bool()
             while not t.all(converged_clusters):
                 # compute cluster probabilities and apply dirichlet distribution prior:
                 self.cluster_probabilities = (t.sum(responsibilities, dim=1) / len(self.cluster_centers))[:,None] # K x len(cluster_concentrations)
-                self.cluster_probabilities = self.cluster_probabilities**(cluster_concentration) # K x len(cluster_concentrations)
+                self.cluster_probabilities = self.cluster_probabilities**(1/cluster_concentration) # K x len(cluster_concentrations)
+                self.cluster_probabilities = self.cluster_probabilities * prior_cluster_probabilities # reapply the prior
                 self.cluster_probabilities = self.cluster_probabilities/t.sum(self.cluster_probabilities, dim=0) #* self.cluster_concentrations[:,0][None,None,:]/t.sum(self.cluster_concentrations[:,0]), dim=2)
                 
                 if print_status:
@@ -259,7 +259,7 @@ class Guassian_Mixture_Model():
                     print("Min cluster-prob: " + str(t.min(self.cluster_probabilities)))
 
                 # maximization step: compute M.L.E. covariance matrices
-                if self.constant_variance: # will compute the mle covariance matrix around each cluster center and then average them based on the original prior over the cluster centers
+                if self.consistent_variance: # will compute the mle covariance matrix around each cluster center and then average them based on the original prior over the cluster centers
                     new_cov = t.zeros(size=self.bandwidths.size(), device=self.device, dtype=self.dtype)
                     for n in range(len(self.cluster_centers)):
                         temp_samples = self.cluster_centers - self.cluster_centers[n] # data centered around n-th sample
@@ -268,7 +268,7 @@ class Guassian_Mixture_Model():
                             temp_cov = t.diag(temp_cov)
                         elif self.covariance_matrix_type == "scalar": 
                             temp_cov = t.mean(t.diag(temp_cov))
-                        new_cov += temp_cov * prior_cluster_probabilities[n] # weight the covariance matrices by the original prior of the cluster centers
+                        new_cov += temp_cov * self.cluster_probabilities[n] # weight the covariance matrices by the original prior of the cluster centers
                     
                     # check that the average covariance matrix is not too small. Adjust it if it is.
                     new_cov = new_cov / minimum_directional_covariance
@@ -313,11 +313,11 @@ class Guassian_Mixture_Model():
                         print("New covariance matrix log-determinant: " + str(t.slogdet(self.bandwidths)[1]))
                 
                 # repeat expectation step
-                responsibilities, L_comp_new = self._expectation(prior_cluster_probabilities, print_status)
+                responsibilities, L_comp_new = self._expectation(print_status)
                 
                 
                 if print_status: print("New comp-log-likelihood: " + str(L_comp_new))
-                if print_status: print(str(t.sum(converged_clusters.float().item())) + " cluster bandwidths have converged.")
+                if print_status: print(str(t.sum(converged_clusters.float()).item()) + " cluster bandwidths have converged.")
                 count += 1
 
                 # check whether convergence conditions have been met
@@ -334,8 +334,8 @@ class Guassian_Mixture_Model():
             self.fitted=True
             return L_comp_new.item()
         except MemoryError: raise MemoryError(f"There is not enough space on device {self.device} to fit a mixture model with the dataset provided.")
-        except OverflowError("OVERFLOW ERROR") as e: 
-            print(e)
+        except OverflowError: 
+            traceback.print_exc()
             return -math.inf
     # end fit()
     
@@ -403,10 +403,7 @@ class Guassian_Mixture_Model():
         ----------
         samples (t.Tensor): The samples upon which the gaussian mixture model will be conditioned. Has shape (num_samples, num_conditioning_features) 
 
-        features (list[int]): The features along which the expected value will be computed.
-
-        NOTE: The number of features in each sample provided and the number of feature indices in "features" must sum together to total the number of 
-            features used to fit the gaussian mixture model, so we must have: samples.shape[1] + len(features) == self.cluster_centers.shape[1]
+        features (list[int]): The features of which the provided samples are comprised.
         
         Returns:
         ----------
@@ -422,71 +419,72 @@ class Guassian_Mixture_Model():
         outputs = t.zeros(size=(len(samples), self.cluster_centers.shape[1]-len(features)), device=str(self.cluster_centers.device), dtype=self.dtype) # keeps track of running sum. Has shape (num_samples, num_conditional features)
         
         # below we compute conditional cluster probabilities with which we weight each cluster's conditional mean to produce the mean of the conditional gaussian mixture model.
-        conditional_cluster_probs = []
-        if self.constant_variance:
-            if self.covariance_matrix_type is "full":
+        conditional_cluster_probs = [] # will be num_clusters x num_samples
+        if self.consistent_variance:
+            if self.covariance_matrix_type == "full":
                 
-                # pull out the conditioned part of the covariance matrix
-                covariance = self.bandwidths[features, features]
+                # pull out the portion of the covariance matrix corresponding to the provided features
+                covariance = self.bandwidths[features,:][:,features]
 
                 # for each cluster center, compute conditional probabilities of all of the samples provided given that cluster
-                for n in range(len(self.cluster_centers)): 
-                    diffs = samples - self.cluster_centers[n,:]
+                for n in range(len(self.cluster_centers)):
+                    diffs = samples - self.cluster_centers[n,features] # num_samples x num_features
                     probs = -(1/2) * t.slogdet(covariance)[1] + (-1/2) * t.sum(t.abs(t.matmul(diffs, t.linalg.inv(covariance)) * diffs),dim=1)
-                    shift = 30 - t.max(probs, dim=0)[0]
-                    probs = t.exp(probs + shift)
                     conditional_cluster_probs.append(probs)
                 
                 # weight conditional sample probs by prior cluster probs to form conditional cluster probs
-                conditional_cluster_probs = self.cluster_probabilities * t.tensor(np.array(conditional_cluster_probs), device=str(self.cluster_centers.device), type=self.dtype).T # N x K
-                conditional_cluster_probs = conditional_cluster_probs / t.sum(conditional_cluster_probs,dim=0)
+                conditional_cluster_probs = t.stack(conditional_cluster_probs) # num_clusters x num_samples
+                conditional_cluster_probs = self.cluster_probabilities * t.exp(conditional_cluster_probs + 30 - t.max(conditional_cluster_probs, dim=0)[0]) # 1 x num_samples
+                conditional_cluster_probs = conditional_cluster_probs/t.sum(conditional_cluster_probs,dim=0)
                 
                 # sum posterior probabilities over the clusters
-                for n in range(len(self.cluster_centers)): 
-                    outputs += conditional_cluster_probs[:,n] * (self.cluster_centers[n,conditional_features] + t.matmul(samples-self.cluster_centers[n,features] / t.diag(self.bandwidths)[features], self.bandwidths[features, conditional_features])) # N x num_given_features
-            if self.covariance_matrix_type is "diagonal":
+                for n in range(len(self.cluster_centers)):
+                    outputs += conditional_cluster_probs[n,:][:,None] * (self.cluster_centers[n,conditional_features][None,:] + t.matmul((samples-self.cluster_centers[n,features]) / t.diag(self.bandwidths)[features], self.bandwidths[features,:][:,conditional_features])) # num_samples x num_conditional_features
+
+            if self.covariance_matrix_type == "diagonal":
                 covariance = self.bandwidths[features]
                 for n in range(len(self.cluster_centers)): 
-                    diffs = samples - self.cluster_centers[n,:]
+                    diffs = samples - self.cluster_centers[n,features]
                     probs = -(1/2) * t.sum(t.log(covariance)) + (-1/2) * t.sum(t.abs(diffs**2 / covariance),dim=1)
                     shift = 30 - t.max(probs, dim=0)[0]
                     probs = t.exp(probs + shift)
                     conditional_cluster_probs.append(probs)
-                conditional_cluster_probs = self.cluster_probabilities * t.tensor(np.array(conditional_cluster_probs), device=str(self.cluster_centers.device), type=self.dtype).T # N x K
+                conditional_cluster_probs = self.cluster_probabilities * t.stack(conditional_cluster_probs) # num_clusters x num_samples
                 conditional_cluster_probs = conditional_cluster_probs / t.sum(conditional_cluster_probs,dim=0)
                 for n in range(len(self.cluster_centers)):
-                    outputs += conditional_cluster_probs[:,n] * (self.cluster_centers[n,conditional_features] + samples-self.cluster_centers[n,features] / self.bandwidths[features] * self.bandwidths[features, conditional_features])
-            if self.covariance_matrix_type is "scalar":
+                    outputs += conditional_cluster_probs[n,:][:,None] * (self.cluster_centers[n,conditional_features][None,:]  + (samples-self.cluster_centers[n,features]) / self.bandwidths[features] * self.bandwidths[features,:][:,conditional_features])
+                    
+            if self.covariance_matrix_type == "scalar":
                 for n in range(len(self.cluster_centers)):
-                    diffs = samples - self.cluster_centers[n,:]
+                    diffs = samples - self.cluster_centers[n,features]
                     probs = -(len(self.cluster_centers.shape[1])/2) * t.log(self.bandwidths) + (-1/2) * t.sum(t.abs(diffs**2 / self.bandwidths),dim=1)
                     shift = 30 - t.max(probs, dim=0)[0]
                     probs = t.exp(probs + shift)
                     conditional_cluster_probs.append(probs)
-                conditional_cluster_probs = self.cluster_probabilities * t.tensor(np.array(conditional_cluster_probs), device=str(self.cluster_centers.device), type=self.dtype).T # N x K
+                conditional_cluster_probs = self.cluster_probabilities * t.stack(conditional_cluster_probs) # num_clusters x num_samples
                 conditional_cluster_probs = conditional_cluster_probs / t.sum(conditional_cluster_probs,dim=0)
                 for n in range(len(self.cluster_centers)):
-                    outputs += conditional_cluster_probs[:,n] * self.cluster_centers[n,conditional_features] + samples-self.cluster_centers[n,features]
+                    outputs += conditional_cluster_probs[n,:][:,None] * self.cluster_centers[n,conditional_features][None,:]  + (samples-self.cluster_centers[n,features])
         else:
-            if self.covariance_matrix_type is "full":
+            if self.covariance_matrix_type == "full":
                 conditional_cluster_probs = []
                 for n in range(len(self.cluster_centers)):
                     covariance = self.bandwidths[features, features]
-                    diffs = samples - self.cluster_centers[n,:]
+                    diffs = samples - self.cluster_centers[n,features]
                     probs = -(1/2) * t.slogdet(covariance)[1] + (-1/2) * t.sum(t.abs(t.matmul(diffs, t.linalg.inv(covariance)) * diffs),dim=1)
                     shift = 30 - t.max(probs, dim=0)[0]
                     probs = t.exp(probs + shift)
                     conditional_cluster_probs.append(probs)
-                conditional_cluster_probs = self.cluster_probabilities * np.array(conditional_cluster_probs).T # N x K
-                conditional_cluster_probs = conditional_cluster_probs / np.sum(conditional_cluster_probs,axis=0)
+                conditional_cluster_probs = self.cluster_probabilities * t.stack(conditional_cluster_probs) # num_clusters x num_samples
+                conditional_cluster_probs = conditional_cluster_probs / t.sum(conditional_cluster_probs,dim=0)
                 for n in range(len(self.cluster_centers)):
-                    outputs += conditional_cluster_probs[:,n] * (self.cluster_centers[n,conditional_features] + t.matmul(samples-self.cluster_centers[n,features] / t.diag(self.bandwidths)[features], self.bandwidths[features, conditional_features])) # N x num_given_features
-            if self.covariance_matrix_type is "diagonal":
+                    outputs += conditional_cluster_probs[:,n][:,None] * (self.cluster_centers[n,conditional_features][None,:]  + t.matmul((samples-self.cluster_centers[n,features]) / t.diag(self.bandwidths)[features], self.bandwidths[features,:][:,conditional_features])) # N x num_given_features
+            if self.covariance_matrix_type == "diagonal":
                 for n in range(len(self.cluster_centers)):
-                    outputs += self.cluster_probabilities[n] * self.cluster_centers[n,conditional_features] + samples-self.cluster_centers[n,features] / self.bandwidths[features] * self.bandwidths[features, conditional_features]
-            if self.covariance_matrix_type is "scalar":
+                    outputs += self.cluster_probabilities[n][:,None] * self.cluster_centers[n,conditional_features][None,:]  + (samples-self.cluster_centers[n,features]) / self.bandwidths[features] * self.bandwidths[features,:][:,conditional_features]
+            if self.covariance_matrix_type == "scalar":
                 for n in range(len(self.cluster_centers)):
-                    outputs += self.cluster_probabilities[n] * self.cluster_centers[n,conditional_features] + samples-self.cluster_centers[n,features] / self.bandwidths * self.bandwidths
+                    outputs += self.cluster_probabilities[n][:,None] * self.cluster_centers[n,conditional_features][None,:]  + (samples-self.cluster_centers[n,features]) / self.bandwidths * self.bandwidths
         return outputs
     # end mean()
     
@@ -494,10 +492,10 @@ class Guassian_Mixture_Model():
     This method carries out the expectation step of the EM algorithm, using the current cluster probability values and cluster 
         covariances to compute responsibilities (posterior probabilities of cluster centers given samples).
     '''
-    def _expectation(self, prior_cluster_probs:t.Tensor, print_status:bool):
+    def _expectation(self, print_status:bool):
         # compute conditional probabilities, P(sample_j | sample_i)
         if self.covariance_matrix_type == 'full':
-            if self.constant_variance: 
+            if self.consistent_variance: 
                 log_probs_front = (-1/2)*t.slogdet(self.bandwidths)[1] # scalar
                 log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(self.cluster_centers-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths)) * self.cluster_centers-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # K x K
             else: 
@@ -505,7 +503,7 @@ class Guassian_Mixture_Model():
                 diffs = t.ones(size=(len(self.cluster_centers), self.cluster_centers.shape[1], len(self.cluster_centers))) * self.cluster_centers[:,:,None] - t.permute(self.cluster_centers[:,:,None], (2,1,0)) # num_clusters x num_features x num_clusters
                 log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ki', t.matmul(t.permute(diffs, (2,0,1)), t.permute(t.linalg.inv(self.bandwidths), (2,0,1))), t.permute(diffs, (2,0,1))) # K x N
         elif self.covariance_matrix_type == 'diagonal': 
-            if self.constant_variance: 
+            if self.consistent_variance: 
                 log_probs_front = (-1/2) * t.sum(t.log(self.bandwidths)) # scalar
                 log_probs = log_probs_front + t.stack(([(-1/2) + t.einsum('ij, ij -> i', ((self.cluster_centers-self.cluster_centers[n,:]) / self.bandwidths, self.cluster_centers-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
             else: 
@@ -513,7 +511,7 @@ class Guassian_Mixture_Model():
                 diffs = t.ones(size=(len(self.cluster_centers), self.cluster_centers.shape[1], len(self.cluster_centers))) * self.cluster_centers[:,:,None] - t.permute(self.cluster_centers[:,:,None], (2,1,0)) # num_clusters x num_features x num_bandwidths
                 log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ki', (diffs / self.bandwidths[None,:,:], diffs)) # K x N
         else: # self.covariance_matrix_type == 'scalar'
-            if self.constant_variance: 
+            if self.consistent_variance: 
                 log_probs_front = (-self.cluster_centers.shape[1]/2) * t.log(self.bandwidths) # scalar
                 log_probs = log_probs_front * t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((self.cluster_centers-self.cluster_centers[n,:]) / self.bandwidths, self.cluster_centers-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
             else: 
@@ -528,11 +526,13 @@ class Guassian_Mixture_Model():
             raise OverflowError(f"Encountered too small of bandwidths in the expectation step (minimum bandwidth encountered is {t.min(t.abs(self.bandwidths)).item()}) causing overflow (inf probabilities). We recommend increasing the \"minimum_variance\" argument or normalizing the samples (to which the distribution is being fit) into a larger window.")
         
         # convert log-likelihoods to linear space
+        shift = t.max(log_probs, dim=0)[0]
         log_probs = log_probs - t.max(log_probs, dim=0)[0] # ensure that all log_probs are <= zero
         log_probs = log_probs / self.responsibility_concentration # bring probs closer together or push them further apart depending on self.responsibility_concentration
+        sum = t.sum(log_probs) # this is what they will need to sum to after adjusting their distribution. This maintains the relative magnitude of the likelihoods.
         log_probs += 30 - t.max(log_probs,dim=0)[0]
         probs = t.exp(log_probs)
-
+        log_probs = log_probs/t.sum(log_probs)*sum + shift # now the log-probs sum to the same as before
         # normalize likelihoods to produce probabilities
         probs = probs/t.sum(probs,dim=0)
 
@@ -554,7 +554,6 @@ class Guassian_Mixture_Model():
 
         # set the sum of the responsibilities for each sample to reflect the samples prior probability
         responsibilities = responsibilities / t.sum(responsibilities, dim = 0)
-        if prior_cluster_probs is not None: responsibilities = responsibilities * t.flatten(prior_cluster_probs) # K x N
 
         if print_status:
             print("Responsibilities:")
@@ -562,6 +561,6 @@ class Guassian_Mixture_Model():
             print("Min responsibility: " + str(t.min(responsibilities)))
             print("Max responsibility: " + str(t.max(responsibilities)))
 
-        L_comp = t.einsum("ij, ij -> ", responsibilities, t.log(probs))
+        L_comp = t.einsum("ij, ij -> ", responsibilities, log_probs)
         return responsibilities, L_comp # returns the responsibilities and the complete log likelihood
     # end _expectation()
