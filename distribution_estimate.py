@@ -1,7 +1,7 @@
 '''
 Author: Tobi Butler
 Last Edited: 08/05/2022
-Purpose: This module defines the Guassian_Mixture_Model class. When instantiated, a Guassian_Mixture_Model object is capable of fitting a mixture model to some provided 
+Purpose: This module defines the Gaussian_Mixture_Model class. When instantiated, a Gaussian_Mixture_Model object is capable of fitting a mixture model to some provided 
 dataset of samples using the Expectation-Maximization algorithm. Once fit, the object can predict the log-likelihood of any given sample within in the same dimensional 
 space as the samples used to fit the model. It can also predict the conditional expected value of some feature(s) given some other feature(s): E(Y|X). This way, the fitted 
 distribution can be used for regression. To use an instance of this class for classification, when calling the fit() method, the user must provide a list-like object of 
@@ -24,14 +24,14 @@ import scipy.integrate as integrate
 
 
 """
-This class contains the methods and attributes to fit a guassian mixture model to a given dataset and can use the fitted model to determine likelihoods of given samples 
+This class contains the methods and attributes to fit a gaussian mixture model to a given dataset and can use the fitted model to determine likelihoods of given samples 
     or probabilities of some given interval. It can also compute the expected value of the distribution along any feature(s).
 """
-class Guassian_Mixture_Model():
+class Gaussian_Mixture_Model():
     """
         Parameters:
         ----------
-        consistent_variance (bool): Determines whether each cluster of the fit guassian mixture model has the same covariance matrix
+        consistent_variance (bool): Determines whether each cluster of the fit gaussian mixture model has the same covariance matrix
 
         covariance_matrix_type (str): Determines how detailed M.L.E. covariance matrices are. Must be one of "full", "diagonal", or "scalar". Default value is "full". 
         Here are there effects:
@@ -61,11 +61,11 @@ class Guassian_Mixture_Model():
         self.num_classes = 1 # the number of 
     
     """
-    Computes the log-likelihood of a provided dataset of samples from the estimated guassian mixture model. The method fit() must have been called before this method 
+    Computes the log-likelihood of a provided dataset of samples from the estimated gaussian mixture model. The method fit() must have been called before this method 
         will work error free. If fit() was provided a tensor of class labels when called most recently (for classification purposes), then this method will return a tensor
         with shape (num_unique_classes, num_samples), in which entry i,j is the log-likelihood of sample j being generated from class i. The classes will indexed in order of 
         their labels, ascending. If fit() was called without class labels, then this method will return a tensor of shape (1, num_samples), in which each entry is the 
-        log-likelihood of the sample being generated from the guassian mixture model.
+        log-likelihood of the sample being generated from the gaussian mixture model.
     """
     def log_likelihood(self, samples: t.Tensor):
         """
@@ -75,7 +75,7 @@ class Guassian_Mixture_Model():
 
         Returns:
         ----------
-        t.Tensor[float]: The log-likelihoods of the provided samples being drawn from the fit guassian mixture model. If fit() was called with class labels, then the 
+        t.Tensor[float]: The log-likelihoods of the provided samples being drawn from the fit gaussian mixture model. If fit() was called with class labels, then the 
             returned log-likelihoods will be of shape (num_unique_classes, num_samples). Otherwise the returned log-likelihoods will be of shape (1, num_samples).
         """
         if not self.fitted: raise ArgumentError("You must fit this kernel density estimate before using it to compute the likelihood of observing some samples.")
@@ -564,3 +564,4 @@ class Guassian_Mixture_Model():
         L_comp = t.einsum("ij, ij -> ", responsibilities, log_probs)
         return responsibilities, L_comp # returns the responsibilities and the complete log likelihood
     # end _expectation()
+    
