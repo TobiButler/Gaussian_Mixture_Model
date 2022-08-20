@@ -10,6 +10,7 @@ be generated from other samples within the same class. Once the model has been f
 one for each class, instead of one.
 '''
 # import modules from std library:
+from dis import dis
 import os
 import sys
 import math
@@ -131,7 +132,7 @@ class Gaussian_Mixture_Model():
     '''
     def fit(self, samples:t.Tensor, class_labels:t.Tensor = None, prior_cluster_probabilities:t.Tensor = None, initial_covariance_matrix:t.Tensor = None, 
         cluster_concentration:float = 1, minimum_total_log_covariance:float = -np.inf, minimum_directional_covariance:float = 1e-12, 
-        responsibility_concentration:float = 1, convergence_flexibility:int = 1, convergence_change:float = 1, print_status = False, 
+        responsibility_concentration:float = 1, convergence_flexibility:int = 1, convergence_change:float = 1, max_iterations:int = 10, print_status = False, 
         attempt_gpu = True):
         """
         Parameters:
@@ -166,6 +167,9 @@ class Gaussian_Mixture_Model():
 
         convergence_change (float): The amount by which the complete-log-likelihood must change upon each iteration of the EM algorithm 
             before it converges. The default minimum change is 1.
+        
+        max_iterations (int): The maximum number of times that the em algorithm loop is allowed to run before converging. This prevents ill-conditioned hyperparameters 
+            from causing the loop to run for a long time or forever.
 
         print-status (bool): Determines whether print statements are output to the console during fitting. This can be helpful when trying 
             to tune hyperparameters.
@@ -245,7 +249,7 @@ class Gaussian_Mixture_Model():
             count = 0 # keeps track of how many iterations the em algorithm has run for
             if self.consistent_variance: converged_clusters = t.zeros(1).bool() # keeps track of how many cluster_centers have converged/had their covariance matrix reach a minimum determinant
             else: converged_clusters = t.zeros(self.cluster_centers.shape[0]).bool()
-            while not t.all(converged_clusters):
+            while True:
                 # compute cluster probabilities and apply dirichlet distribution prior:
                 self.cluster_probabilities = (t.sum(responsibilities, dim=1) / len(self.cluster_centers))[:,None] # K x len(cluster_concentrations)
                 self.cluster_probabilities = self.cluster_probabilities**(1/cluster_concentration) # K x len(cluster_concentrations)
@@ -325,12 +329,16 @@ class Gaussian_Mixture_Model():
                     convergence_count += 1
                     if convergence_count >= convergence_flexibility:
                         if print_status: print("EM algorithm has converged after " + str(count) + " iterations. Log-likelihood = " + str(L_comp_new.item()))
-                        self.fitted = True
                         break
+                elif t.all(converged_clusters):
+                    if print_status: print("All cluster bandwidths converged to minimum value. EM algorithm has converged after " + str(count) + " iterations. Log-likelihood = " + str(L_comp_new.item()))
+                    break
+                elif count >= max_iterations:
+                    if print_status: print("EM algorithm ran for maximum allowed number of iterations: " + str(count) + ". Log-likelihood = " + str(L_comp_new.item()))
+                    break
                 else: convergence_count=0
                 L_comp_old = L_comp_new
             
-            if t.all(converged_clusters) and print_status: print("All cluster bandwidths converged to minimum value.")
             self.fitted=True
             return L_comp_new.item()
         except MemoryError: raise MemoryError(f"There is not enough space on device {self.device} to fit a mixture model with the dataset provided.")
@@ -565,3 +573,63 @@ class Gaussian_Mixture_Model():
         return responsibilities, L_comp # returns the responsibilities and the complete log likelihood
     # end _expectation()
     
+def join_distributions(distribution1:Gaussian_Mixture_Model, distribution2:Gaussian_Mixture_Model):
+    # check that distribution1 and distribution2 can be joined
+    if not distribution1.fitted or not distribution2.fitted: raise ArgumentError("Both Gaussian_Mixture_Model objects must have been fit before they can be joined.")
+    if (distribution1.cluster_centers.shape != distribution2.cluster_centers.shape) or (t.sum(t.abs(distribution1.cluster_centers)) != t.sum(t.abs(distribution2.cluster_centers))): raise ArgumentError("Both Gaussian_Mixture_Model objects must have been fit using the same dataset.")
+    # put both distributions onto the same device:
+    if distribution1.device != distribution2.device:
+        distribution2.cluster_centers = distribution2.cluster_centers.to(device=distribution1.device, dtype=distribution1.dtype)
+        distribution2.cluster_probabilities = distribution2.cluster_probabilities.to(device=distribution1.device, dtype=distribution1.dtype)
+        distribution2.bandwidths = distribution2.bandwidths.to(device=distribution1.device, dtype=distribution1.dtype)
+    
+    # compute updated cluster_probabilities:
+    cluster_probs = distribution1.cluster_probabilities*distribution2.cluster_probabilities
+    normalizing_constant = t.sum(cluster_probs)
+    cluster_probs /= normalizing_constant
+
+    # compute updated cluster covariance matrices:
+    if distribution1.consistent_variance: # will use the same covariance matrix for all clusters from distribution1
+        if distribution1.covariance_matrix_type == "full": bandwidth1 = distribution1.bandwidths
+        else: bandwidth1 = t.eye(distribution1.bandwidths.shape[1], device=distribution1.device, dtype=distribution1.dtype) * distribution1.bandwidths
+        if distribution2.consistent_variance: # will use the same covariance matrices for all clusters from distribution2
+            if distribution2.covariance_matrix_type == "full": bandwidth2 = distribution2.bandwidths
+            else:bandwidth2 = t.eye(distribution2.bandwidths.shape[1], device=distribution1.device, dtype=distribution1.dtype) * distribution2.bandwidths
+            covariance_matrix = t.zeros(size = distribution1.bandwidths.size(), device=distribution1.device, dtype=distribution1.dtype)
+            for n in range(len(cluster_probs)):
+                covariance_matrix += cluster_probs[n] * (distribution1.cluster_probabilities[n] * bandwidth1 + distribution2.cluster_probabilities[n] * bandwidth2) / (distribution1.cluster_probabilities[n] + distribution2.cluster_probabilities[n])
+            distribution1.bandwidths = covariance_matrix
+        else: # each cluster from distribution2 has its own covariance matrix:
+            if distribution2.covariance_matrix_type == "full":
+                for n in range(len(cluster_probs)):
+                    distribution1.bandwidths[n] = (distribution1.cluster_probabilities[n] * bandwidth1 + distribution2.cluster_probabilities[n] * distribution2.bandwidths[n]) / (distribution1.cluster_probabilities[n] + distribution2.cluster_probabilities[n])
+            else:
+                for n in range(len(cluster_probs)):
+                    distribution1.bandwidths[n] = (distribution1.cluster_probabilities[n] * bandwidth1 + distribution2.cluster_probabilities[n] * t.eye(distribution2.bandwidths.shape[1], device=distribution1.device, dtype=distribution1.dtype) * distribution2.bandwidths[n]) / (distribution1.cluster_probabilities[n] + distribution2.cluster_probabilities[n])
+    else: # each cluster from distribution1 has its own covariance matrix:
+        if distribution2.consistent_variance: # will use the same covariance matrices for all clusters from distribution2
+            if distribution2.covariance_matrix_type == "full": bandwidth2 = distribution2.bandwidths
+            else:bandwidth2 = t.eye(distribution2.bandwidths.shape[1], device=distribution1.device, dtype=distribution1.dtype) * distribution2.bandwidths
+            if distribution1.covariance_matrix_type == "full":
+                for n in range(len(cluster_probs)):
+                    distribution1.bandwidths[n] = (distribution1.cluster_probabilities[n] * distribution1.bandwidths[n] + distribution2.cluster_probabilities[n] * bandwidth2) / (distribution1.cluster_probabilities[n] + distribution2.cluster_probabilities[n])
+            else:
+                for n in range(len(cluster_probs)):
+                    distribution1.bandwidths[n] = (distribution1.cluster_probabilities[n] * t.eye(distribution1.bandwidths.shape[1], device=distribution1.device, dtype=distribution1.dtype) * distribution1.bandwidths[n] + distribution2.cluster_probabilities[n] * bandwidth2) / (distribution1.cluster_probabilities[n] + distribution2.cluster_probabilities[n])
+        else: # each cluster from distribution2 has its own covariance matrix:
+            if distribution1.covariance_matrix_type == "full":
+                if distribution2.covariance_matrix_type == "full":
+                    for n in range(len(cluster_probs)):
+                        distribution1.bandwidths[n] = (distribution1.cluster_probabilities[n] * distribution1.bandwidths[n] + distribution2.cluster_probabilities[n] * distribution2.bandwidths[n]) / (distribution1.cluster_probabilities[n] + distribution2.cluster_probabilities[n])
+                else:
+                    for n in range(len(cluster_probs)):
+                        distribution1.bandwidths[n] = (distribution1.cluster_probabilities[n] * distribution1.bandwidths[n] + distribution2.cluster_probabilities[n] * t.eye(distribution2.bandwidths.shape[1], device=distribution1.device, dtype=distribution1.dtype) * distribution2.bandwidths[n]) / (distribution1.cluster_probabilities[n] + distribution2.cluster_probabilities[n])
+            else:
+                if distribution2.covariance_matrix_type == "full":
+                    for n in range(len(cluster_probs)):
+                        distribution1.bandwidths[n] = (distribution1.cluster_probabilities[n] * t.eye(distribution1.bandwidths.shape[1], device=distribution1.device, dtype=distribution1.dtype) * distribution1.bandwidths[n] + distribution2.cluster_probabilities[n] * distribution2.bandwidths[n]) / (distribution1.cluster_probabilities[n] + distribution2.cluster_probabilities[n])
+                else:
+                    for n in range(len(cluster_probs)):
+                        distribution1.bandwidths[n] = (distribution1.cluster_probabilities[n] * t.eye(distribution1.bandwidths.shape[1], device=distribution1.device, dtype=distribution1.dtype) * distribution1.bandwidths[n] + distribution2.cluster_probabilities[n] * t.eye(distribution2.bandwidths.shape[1], device=distribution1.device, dtype=distribution1.dtype) * distribution2.bandwidths[n]) / (distribution1.cluster_probabilities[n] + distribution2.cluster_probabilities[n])
+    distribution1.cluster_probabilities = cluster_probs
+    return distribution1
