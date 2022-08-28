@@ -21,6 +21,8 @@ import traceback
 import torch as t
 import numpy as np
 import scipy.integrate as integrate
+import psutil
+import pynvml
 
 
 """
@@ -86,35 +88,9 @@ class Gaussian_Mixture_Model():
         # check method arguments:
         if samples.dim() != 2: raise ArgumentError("The provided \"samples\" must be a 2 dimensional torch.Tensor of shape (num_samples, num_features).")
         if str(samples.device) != self.device or samples.dtype != self.dtype: samples = samples.to(device=self.device, dtype=self.dtype)
-        # compute likelihoods
-        if self.covariance_matrix_type == 'full':
-            if self.consistent_variance: 
-                log_probs_front = (-1/2)*t.slogdet(self.bandwidths)[1] # scalar
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(samples-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths)) * samples-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # num_clusters x num_samples
-                else: 
-                    diffs = samples[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_samples x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', t.matmul(diffs, t.linalg.inv(self.bandwidths[None,:,:])), diffs) # K x N
-            else: 
-                log_probs_front = (-1/2) * t.slogdet(self.bandwidths)[1][:,None] # num_clusters x 1
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(samples-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths[n])) * samples-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # K x K
-                else:
-                    diffs = samples[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_samples x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', t.matmul(diffs, t.linalg.inv(self.bandwidths)), diffs) # K x N
-        else:
-            if self.covariance_matrix_type == 'diagonal': log_probs_front = (-1/2) * t.sum(t.log(self.bandwidths), dim=1)[:,None]
-            else: log_probs_front = (-self.cluster_centers.shape[1]/2) * t.log(self.bandwidths)
-        
-            # the following steps have the same syntax for diagonal as scalar covariance matrix types
-            if self.consistent_variance: 
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((samples-self.cluster_centers[n,:]) / self.bandwidths, samples-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
-                else:
-                    diffs = samples[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_samples x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', (diffs / self.bandwidths[:,None,:], diffs)) # K x N
-            else: 
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((samples-self.cluster_centers[n,:]) / self.bandwidths[n], samples-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
-                else:
-                    diffs = samples[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_samples x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', (diffs / self.bandwidths[:,None,:], diffs)) # K x N
+        # compute log-likelihoods
+        log_probs = self._log_likelihoods(samples=samples)
+        log_probs  += (-self.cluster_centers.shape[1]/2)*math.log(2*math.pi) # multiply likelihoods by normalization constant so that entire distribution sums to 1.
         
         # shift the log-likelihoods by a constant so that they don't underflow when converted to linear space. This is the same as multiplying the linear likelihoods by a scalar.
         shift = 30 - t.max(log_probs, dim=0)[0]
@@ -543,35 +519,7 @@ class Gaussian_Mixture_Model():
     """
     def cluster(self, num_clusters, samples:t.Tensor = None):
         # produce matrix of likelihoods: i,j = P(sample j | cluster i)
-        if samples is None: samples = self.cluster_centers
-        if self.covariance_matrix_type == 'full':
-            if self.consistent_variance: 
-                log_probs_front = (-1/2)*t.slogdet(self.bandwidths)[1] # scalar
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(samples-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths)) * samples-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # num_clusters x num_samples
-                else: 
-                    diffs = samples[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_samples x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', t.matmul(diffs, t.linalg.inv(self.bandwidths[None,:,:])), diffs) # K x N
-            else: 
-                log_probs_front = (-1/2) * t.slogdet(self.bandwidths)[1][:,None] # num_clusters x 1
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(samples-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths[n])) * samples-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # K x K
-                else:
-                    diffs = samples[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_samples x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', t.matmul(diffs, t.linalg.inv(self.bandwidths)), diffs) # K x N
-        else:
-            if self.covariance_matrix_type == 'diagonal': log_probs_front = (-1/2) * t.sum(t.log(self.bandwidths), dim=1)[:,None]
-            else: log_probs_front = (-self.cluster_centers.shape[1]/2) * t.log(self.bandwidths)
-        
-            # the following steps have the same syntax for diagonal as scalar covariance matrix types
-            if self.consistent_variance: 
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((samples-self.cluster_centers[n,:]) / self.bandwidths, samples-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
-                else:
-                    diffs = samples[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_samples x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', (diffs / self.bandwidths[:,None,:], diffs)) # K x N
-            else: 
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((samples-self.cluster_centers[n,:]) / self.bandwidths[n], samples-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
-                else:
-                    diffs = samples[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_samples x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', (diffs / self.bandwidths[:,None,:], diffs)) # K x N
+        log_probs = self._log_likelihoods(samples=samples)
         
         # convert log-likelihoods to probabilities. We let the likelihoods sum to one to avoid underflow
         log_probs += 30 - t.max(log_probs)
@@ -619,54 +567,8 @@ class Gaussian_Mixture_Model():
         covariances to compute responsibilities (posterior probabilities of cluster centers given samples).
     '''
     def _expectation(self, print_status:bool):
-        # compute conditional probabilities, P(sample_j | sample_i)
-        if self.covariance_matrix_type == 'full':
-            if self.consistent_variance: 
-                log_probs_front = (-1/2)*t.slogdet(self.bandwidths)[1] # scalar
-                ###if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(self.cluster_centers-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths)) * self.cluster_centers-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # K x K
-                if self.limited_memory:
-                    log_probs = []
-                    for n in range(len(self.cluster_centers)):
-                        #print(n)
-                        log_probs.append((-1/2) * t.sum(t.abs(t.matmul(self.cluster_centers-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths)) * self.cluster_centers-self.cluster_centers[n,:]),dim=1))
-                    log_probs = log_probs_front + t.stack(log_probs)
-                else: 
-                    diffs = self.cluster_centers[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_clusters x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', t.matmul(diffs, t.linalg.inv(self.bandwidths[None,:,:])), diffs) # K x N
-            else: 
-                log_probs_front = (-1/2) * t.slogdet(self.bandwidths)[1][:,None] # num_clusters x 1
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(self.cluster_centers-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths[n])) * self.cluster_centers-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # K x K
-                else:
-                    diffs = self.cluster_centers[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_clusters x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', t.matmul(diffs, t.linalg.inv(self.bandwidths)), diffs) # K x N
-        else:
-            if self.covariance_matrix_type == 'diagonal': log_probs_front = (-1/2) * t.sum(t.log(self.bandwidths), dim=1)[:,None]
-            else: log_probs_front = (-self.cluster_centers.shape[1]/2) * t.log(self.bandwidths)
-        
-            # the following steps have the same syntax for diagonal as scalar covariance matrix types
-            if self.consistent_variance: 
-                #if self.limited_memory:
-                    #log_probs = []
-                    #for n in range(len(self.cluster_centers)):
-                        #print(n)
-                        #log_probs.append((-1/2) * t.einsum('ij, ij -> i', ((self.cluster_centers-self.cluster_centers[n,:]) / self.bandwidths, self.cluster_centers-self.cluster_centers[n,:])))
-                    #log_probs = log_probs_front + t.stack(log_probs)
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((self.cluster_centers-self.cluster_centers[n,:]) / self.bandwidths, self.cluster_centers-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
-                else:
-                    diffs = self.cluster_centers[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_clusters x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', (diffs / self.bandwidths[:,None,:], diffs)) # K x N
-            else: 
-                if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((self.cluster_centers-self.cluster_centers[n,:]) / self.bandwidths[n], self.cluster_centers-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
-                else:
-                    diffs = self.cluster_centers[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_clusters x num_features 
-                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', (diffs / self.bandwidths[:,None,:], diffs)) # K x N
+        log_probs = self._log_likelihoods()
             
-        # check if bandwidths have overflowed
-        if t.isneginf(log_probs_front).any(): # check if any bandwidths become too large.
-            raise ArgumentError(f"Encountered too large of bandwidths in the expectation step (maximum bandwidth encountered is {t.max(t.abs(self.bandwidths)).item()}) causing underflow (zero probabilities). We recommend normalizing the samples (to which the distribution is being fit) into a smaller window.")
-        if (t.isinf(t.abs(log_probs_front)).any()): # check if any bandwidths become too small.
-            raise OverflowError(f"Encountered too small of bandwidths in the expectation step (minimum bandwidth encountered is {t.min(t.abs(self.bandwidths)).item()}) causing overflow (inf probabilities). We recommend increasing the \"minimum_variance\" argument or normalizing the samples (to which the distribution is being fit) into a larger window.")
-        
         # convert log-likelihoods to linear space
         probs = log_probs - t.max(log_probs, dim=0)[0] # ensure that all log_probs are <= zero
         probs = probs / self.responsibility_concentration # bring probs closer together or push them further apart depending on self.responsibility_concentration
@@ -702,6 +604,86 @@ class Gaussian_Mixture_Model():
         L_comp = t.einsum("ij, ij -> ", responsibilities, log_probs)
         return responsibilities, L_comp # returns the responsibilities and the complete log likelihood
     # end _expectation()
+
+    """
+    Compute the log-likelihoods of a sample of points being generated by the current distribution (cluster centers and bandwidths). 
+        These computations are done frequently enough to warrant separating them into their own method.
+    """
+    def _log_likelihoods(self, samples:t.Tensor = None):
+        if samples is None: samples = self.cluster_centers
+
+        # compute log likelihoods of generating samples from this distribution's cluster centers
+        if self.limited_memory:
+            if self.consistent_variance and self.covariance_matrix_type == "full": inv = t.linalg.inv(self.bandwidths)
+            log_probs = t.ones(size=(self.cluster_centers.shape[0],self.cluster_centers.shape[1]), device = self.device, dtype=self.dtype)
+            # determine how many values can be stored using available ram:
+            if self.device == "cuda":
+                pynvml.nvmlInit()
+                floats_available = int(pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0)).free / self.dtype(0).itemsize)
+            else:
+                floats_available = int(psutil.virtual_memory()[4] / 2 / self.dtype(0).itemsize)
+            
+            batch_size = (floats_available - len(self.cluster_centers))/(2*len(self.cluster_centers)) # need to hold responsibilities, log_probs_front, and as many double sets of one cluster center minus all the other cluster centers as possible
+
+        # compute conditional probabilities, P(sample_j | sample_i)
+        if self.covariance_matrix_type == 'full':
+            if self.consistent_variance: 
+                log_probs_front = (-1/2)*t.slogdet(self.bandwidths)[1] # scalar
+                ###if self.limited_memory: log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(self.cluster_centers-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths)) * self.cluster_centers-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # K x K
+                if self.limited_memory:
+                    for n in range(int(len(self.cluster_centers)/batch_size)): # may need to make inv into inv[None,:,:] below in which case need to update space required above
+                        diffs = self.cluster_centers[None,:,:]-self.cluster_centers[n*batch_size:(n+1)*batch_size,None,:] # batch_size x num_clusters x num_features
+                        log_probs[n*batch_size:(n+1)*batch_size,:] = (-1/2) * t.sum(t.abs(t.matmul(diffs, inv) * diffs),dim=2)
+                    diffs = self.cluster_centers[None,:,:]-self.cluster_centers[-int(len(self.cluster_centers)%batch_size):,None,:] # batch_size x num_clusters x num_features
+                    log_probs[-int(len(self.cluster_centers)%batch_size):,:] = (-1/2) * t.sum(t.abs(t.matmul(diffs, inv) * diffs),dim=2)
+                    log_probs = log_probs_front + log_probs
+                else: 
+                    diffs = self.cluster_centers[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_clusters x num_features 
+                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', t.matmul(diffs, inv), diffs) # K x N
+            else: 
+                log_probs_front = (-1/2) * t.slogdet(self.bandwidths)[1][:,None] # num_clusters x 1
+                if self.limited_memory: 
+                    for n in range(int(len(self.cluster_centers)/batch_size)): # may need to make inv into inv[None,:,:] below in which case need to update space required above
+                        diffs = self.cluster_centers[None,:,:]-self.cluster_centers[n*batch_size:(n+1)*batch_size,None,:] # batch_size x num_clusters x num_features
+                        log_probs[n*batch_size:(n+1)*batch_size,:] = (-1/2) * t.sum(t.abs(t.matmul(diffs, t.linalg.inv(self.bandwidths[n*batch_size:(n+1)*batch_size])) * diffs),dim=2)
+                    diffs = self.cluster_centers[None,:,:]-self.cluster_centers[-int(len(self.cluster_centers)%batch_size):,None,:] # batch_size x num_clusters x num_features
+                    log_probs[-int(len(self.cluster_centers)%batch_size):,:] = (-1/2) * t.sum(t.abs(t.matmul(diffs, t.linalg.inv(self.bandwidths[-int(len(self.cluster_centers)%batch_size):])) * diffs),dim=2)
+                    log_probs = log_probs_front + log_probs
+                    
+                    ###log_probs = log_probs_front + t.stack(([(-1/2) * t.sum(t.abs(t.matmul(self.cluster_centers-self.cluster_centers[n,:], t.linalg.inv(self.bandwidths[n])) * self.cluster_centers-self.cluster_centers[n,:]),dim=1) for n in range(len(self.cluster_centers))])) # K x K
+                else:
+                    diffs = self.cluster_centers[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_clusters x num_features 
+                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', t.matmul(diffs, t.linalg.inv(self.bandwidths)), diffs) # K x N
+        else:
+            if self.covariance_matrix_type == 'diagonal': log_probs_front = (-1/2) * t.sum(t.log(self.bandwidths), dim=1)[:,None]
+            else: log_probs_front = (-self.cluster_centers.shape[1]/2) * t.log(self.bandwidths)
+        
+            # the following steps have the same syntax for diagonal as scalar covariance matrix types
+            if self.consistent_variance: 
+                if self.limited_memory: 
+                    for n in range(int(len(self.cluster_centers)/batch_size)): # may need to make inv into inv[None,:,:] below in which case need to update space required above
+                        diffs = self.cluster_centers[None,:,:]-self.cluster_centers[n*batch_size:(n+1)*batch_size,None,:] # batch_size x num_clusters x num_features
+                        log_probs[n*batch_size:(n+1)*batch_size,:] = (-1/2) * t.einsum("ijk,ijk->ij", diffs / self.bandwidths[None,:,:], diffs)
+                    diffs = self.cluster_centers[None,:,:]-self.cluster_centers[-int(len(self.cluster_centers)%batch_size):,None,:] # batch_size x num_clusters x num_features
+                    log_probs[-int(len(self.cluster_centers)%batch_size):,:] = (-1/2) * t.einsum("ijk,ijk->ij", diffs / self.bandwidths[None,:,:], diffs)
+                    log_probs = log_probs_front + log_probs
+                    ###log_probs = log_probs_front + t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((self.cluster_centers-self.cluster_centers[n,:]) / self.bandwidths, self.cluster_centers-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
+                else:
+                    diffs = self.cluster_centers[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_clusters x num_features 
+                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', (diffs / self.bandwidths[:,None,:], diffs)) # K x N
+            else: 
+                if self.limited_memory: 
+                    for n in range(int(len(self.cluster_centers)/batch_size)): # may need to make inv into inv[None,:,:] below in which case need to update space required above
+                        diffs = self.cluster_centers[None,:,:]-self.cluster_centers[n*batch_size:(n+1)*batch_size,None,:] # batch_size x num_clusters x num_features
+                        log_probs[n*batch_size:(n+1)*batch_size,:] = (-1/2) * t.einsum("ijk,ijk->ij", diffs / self.bandwidths[n*batch_size:(n+1)*batch_size,None,:], diffs)
+                    diffs = self.cluster_centers[None,:,:]-self.cluster_centers[-int(len(self.cluster_centers)%batch_size):,None,:] # batch_size x num_clusters x num_features
+                    log_probs[-int(len(self.cluster_centers)%batch_size):,:] = (-1/2) * (-1/2) * t.einsum("ijk,ijk->ij", diffs / self.bandwidths[-int(len(self.cluster_centers)%batch_size):,None,:], diffs)
+                    log_probs = log_probs_front + log_probs
+                    ###log_probs = log_probs_front + t.stack(([(-1/2) * t.einsum('ij, ij -> i', ((self.cluster_centers-self.cluster_centers[n,:]) / self.bandwidths[n], self.cluster_centers-self.cluster_centers[n,:])) for n in range(len(self.cluster_centers))])) # K x N
+                else:
+                    diffs = self.cluster_centers[None,:,:] - self.cluster_centers[:,None,:] # num_clusters x num_clusters x num_features 
+                    log_probs = log_probs_front + (-1/2) * t.einsum('ijk, ijk -> ij', (diffs / self.bandwidths[:,None,:], diffs)) # K x N
+        return log_probs
     
 def join_distributions(distribution1:Gaussian_Mixture_Model, distribution2:Gaussian_Mixture_Model, limited_memory:bool = True, dtype = t.float64):
     # check that distribution1 and distribution2 can be joined
